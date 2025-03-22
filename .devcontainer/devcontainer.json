@@ -1,9 +1,0 @@
-{
-    "name": "MediaEmpire Dev",
-    "image": "the_oahu_edge",
-    "customizations": {
-        "vscode": {
-            "extensions": ["ms-python.python", "ms-python.vscode-pylance"]
-        }
-    }
-}
