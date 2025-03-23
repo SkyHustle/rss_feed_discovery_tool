@@ -1,4 +1,7 @@
 langchain
 langchain-openai
+langchain-community
 feedparser
 python-dotenv
+requests
+duckduckgo-search>=0.3.2
