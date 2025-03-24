@@ -252,9 +252,13 @@ def main():
     PROMPT = sys.argv[1]
     print(f"Running with prompt: {PROMPT}")
     
+    # Ensure feeds directory exists
+    feeds_dir = "feeds"
+    os.makedirs(feeds_dir, exist_ok=True)
+    
     # Generate a filename based on the prompt
     filename = re.sub(r'[^\w\s]', '', PROMPT.lower())[:20].strip().replace(' ', '_')
-    output_file = f"{filename}_rss_feeds_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+    output_file = os.path.join(feeds_dir, f"{filename}_rss_feeds_{datetime.now().strftime('%Y%m%d%H%M%S')}.json")
     
     # Storage for feeds we've found and websites we've checked
     valid_feeds = []

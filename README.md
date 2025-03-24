@@ -31,9 +31,12 @@ A Python script that automates the discovery and validation of RSS feeds based o
     ```
 
 3. Create a `.env` file in the project directory with your OpenRouter API key:
+
     ```
     OPENROUTER_API_KEY=your_api_key_here
     ```
+
+    A template `.env.example` file is provided for reference.
 
 ## Usage
 
@@ -48,9 +51,9 @@ The script will:
 1. Ask the LLM for relevant news websites based on your prompt
 2. Find and validate RSS feeds from these websites
 3. Deduplicate the results to ensure variety
-4. Save the valid feeds to a JSON file
+4. Save the valid feeds to a JSON file in the `feeds` directory
 
-The output JSON file will contain up to 10 valid RSS feeds related to your query.
+The output JSON file will contain up to 10 valid RSS feeds related to your query and will be stored in the `feeds` directory with a filename based on your prompt.
 
 ## How It Works
 
@@ -86,7 +89,7 @@ The script ensures variety in the results by:
 
 ### 5. Result Storage
 
-Valid feeds are saved to a JSON file named based on your prompt:
+Valid feeds are saved to a JSON file in the `feeds` directory, named based on your prompt:
 
 ```
 {
@@ -101,6 +104,18 @@ Valid feeds are saved to a JSON file named based on your prompt:
   "count": 10,
   "query": "Your original prompt"
 }
+```
+
+## Project Structure
+
+```
+.
+├── rss_discovery.py     # Main script
+├── requirements.txt     # Dependencies
+├── .env.example         # Template for environment variables
+├── .env                 # Your actual environment variables (not in repository)
+├── README.md            # This documentation
+└── feeds/               # Directory for output JSON files
 ```
 
 ## Configuration
