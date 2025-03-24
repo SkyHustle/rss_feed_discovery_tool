@@ -4,26 +4,74 @@ import time
 import os
 import re
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import feedparser
 from langchain_openai import ChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
-from langchain.tools import tool
-from langchain.agents import create_tool_calling_agent, AgentExecutor
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.tools import Tool
-from langchain_community.tools.ddg_search.tool import DuckDuckGoSearchTool
+from langchain.schema import HumanMessage
+import concurrent.futures
+from urllib.parse import urlparse
 
 # Load environment variables from .env file
 load_dotenv()
 
+# Function to normalize URL for comparison
+def normalize_url(url):
+    # Remove trailing slash
+    if url.endswith('/'):
+        url = url[:-1]
+    # Ensure lowercase for comparison
+    return url.lower()
+
+# Function to find potential RSS feed URLs from a base website URL
+def find_rss_feeds_from_site(base_url):
+    # Prioritize /feed/ as the main path based on examples
+    common_paths = [
+        "/feed/",  # Primary path to try first
+        "/feed",
+        "/rss/",
+        "/rss",
+        "/news/feed/",
+        "/index.rss"
+    ]
+    
+    result = []
+    # Clean up URL
+    if base_url.endswith('/'):
+        base_url = base_url[:-1]
+    
+    # Handle URLs that might already contain feed paths
+    if any(feed_path in base_url.lower() for feed_path in ['/feed', '/rss']):
+        result.append(base_url)
+    
+    # Try common RSS feed paths
+    for path in common_paths:
+        result.append(f"{base_url}{path}")
+    
+    return result
+
+# Function to safely compare dates, handling timezone-aware and naive datetimes
+def is_recent_date(date_obj, hours=72):
+    # If date is None, we can't determine if it's recent
+    if date_obj is None:
+        return True
+    
+    now = datetime.now(timezone.utc)
+    
+    # If date is naive (no timezone), assume UTC
+    if date_obj.tzinfo is None:
+        date_obj = date_obj.replace(tzinfo=timezone.utc)
+    
+    # Compare dates safely
+    return (now - date_obj) <= timedelta(hours=hours)
+
 # Function to validate an RSS feed
 def validate_rss_feed(url):
-    print(f"Validating RSS feed: {url}")
     try:
         # Make a request to the feed URL
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=10, headers={
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+        })
         response.raise_for_status()  # Raise an exception for HTTP errors
         
         # Parse the feed
@@ -31,196 +79,167 @@ def validate_rss_feed(url):
         
         # Check if it's a valid RSS feed
         if feed.bozo and not feed.entries:
-            print(f"  ❌ Invalid RSS feed format: {url}")
             return False, None
         
         # Check if the feed has entries
         if not feed.entries:
-            print(f"  ❌ No entries found in the feed: {url}")
-            return False, None
-            
-        # Check build date if available
-        build_date = None
-        if hasattr(feed.feed, 'lastbuilddate'):
-            build_date = feed.feed.lastbuilddate
-        elif hasattr(feed.feed, 'updated'):
-            build_date = feed.feed.updated
-            
-        if build_date:
-            try:
-                # Parse the date - try different formats
-                parsed_date = None
-                for date_format in [
-                    '%a, %d %b %Y %H:%M:%S %z',      # RFC 822 format
-                    '%a, %d %b %Y %H:%M:%S %Z',      # RFC 822 with timezone name
-                    '%Y-%m-%dT%H:%M:%S%z',           # ISO 8601
-                    '%Y-%m-%dT%H:%M:%SZ',            # ISO 8601 UTC
-                    '%Y-%m-%dT%H:%M:%S.%f%z',        # ISO 8601 with microseconds
-                    '%Y-%m-%d %H:%M:%S',             # Simple format
-                ]:
-                    try:
-                        parsed_date = datetime.strptime(build_date, date_format)
-                        break
-                    except ValueError:
-                        continue
-                        
-                if parsed_date and datetime.now() - parsed_date > timedelta(hours=72):
-                    print(f"  ❌ Feed last build date is older than 72 hours: {url}")
-                    return False, None
-            except Exception as e:
-                print(f"  ⚠️ Error parsing build date: {e}")
-                # Continue validation even if we can't parse the date
-        
-        # Check the newest entry's date
-        newest_entry_date = None
-        for entry in feed.entries:
-            entry_date = None
-            if hasattr(entry, 'published'):
-                entry_date = entry.published
-            elif hasattr(entry, 'updated'):
-                entry_date = entry.updated
-                
-            if entry_date:
-                try:
-                    # Parse the date - try different formats
-                    parsed_date = None
-                    for date_format in [
-                        '%a, %d %b %Y %H:%M:%S %z',      # RFC 822 format
-                        '%a, %d %b %Y %H:%M:%S %Z',      # RFC 822 with timezone name
-                        '%Y-%m-%dT%H:%M:%S%z',           # ISO 8601
-                        '%Y-%m-%dT%H:%M:%SZ',            # ISO 8601 UTC
-                        '%Y-%m-%dT%H:%M:%S.%f%z',        # ISO 8601 with microseconds
-                        '%Y-%m-%d %H:%M:%S',             # Simple format
-                    ]:
-                        try:
-                            parsed_date = datetime.strptime(entry_date, date_format)
-                            break
-                        except ValueError:
-                            continue
-                            
-                    if parsed_date and (newest_entry_date is None or parsed_date > newest_entry_date):
-                        newest_entry_date = parsed_date
-                except Exception as e:
-                    print(f"  ⚠️ Error parsing entry date: {e}")
-                    continue
-        
-        if newest_entry_date and datetime.now() - newest_entry_date > timedelta(hours=72):
-            print(f"  ❌ Newest entry is older than 72 hours: {url}")
             return False, None
             
         # Get feed title for reference
         feed_title = feed.feed.title if hasattr(feed.feed, 'title') else "Unknown"
         
-        print(f"  ✅ Valid RSS feed: {feed_title}")
-        return True, {"url": url, "title": feed_title}
+        # Get domain for source classification
+        domain = urlparse(url).netloc
+        
+        # Consider it valid if it has entries
+        return True, {"url": url, "title": feed_title, "domain": domain}
         
     except Exception as e:
-        print(f"  ❌ Error validating feed: {str(e)}")
         return False, None
 
-# Tool for the LLM to discover RSS feeds
-@tool
-def discover_rss_feeds(query: str) -> str:
-    """
-    Use this function to search the web for RSS feeds related to the query.
-    The function should return a list of potential RSS feed URLs.
-    """
+# Function to ask the LLM for relevant news websites
+def get_news_websites_from_llm(prompt, already_checked=None):
+    # Get the API key
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        print("Error: OPENROUTER_API_KEY not found in environment variables.")
+        print("Please make sure your .env file contains the OPENROUTER_API_KEY.")
+        sys.exit(1)
+    
     try:
-        # Create search tool
-        search_tool = DuckDuckGoSearchTool()
+        # Initialize the LLM
+        llm = ChatOpenAI(
+            model="google/gemini-2.0-flash-exp:free",
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1"
+        )
         
-        # Enhance the search query to target RSS feeds
-        enhanced_query = f"{query} filetype:xml OR filetype:rss OR inurl:rss OR inurl:feed"
-        print(f"Searching for: {enhanced_query}")
-        
-        # Search for potential feeds
-        results = search_tool.run(enhanced_query)
-        
-        # Look for URLs in the results that are likely RSS feeds
-        potential_feeds = []
-        for line in results.split('\n'):
-            # Extract URLs from the search results
-            urls = re.findall(r'https?://[^\s"\'<>]+', line)
-            for url in urls:
-                # Look for URLs that are likely RSS feeds
-                if any(keyword in url.lower() for keyword in ['rss', 'feed', 'xml', 'atom']):
-                    potential_feeds.append(url)
-        
-        # If we don't have enough potential feeds, try a different search approach
-        if len(potential_feeds) < 5:
-            # Try a second search with different terms
-            site_query = f"{query} news site OR newspaper OR media hawaiian"
-            print(f"Looking for Hawaiian news sites: {site_query}")
+        # Create the prompt for the LLM
+        if already_checked and len(already_checked) > 0:
+            system_message = f"""You are a helpful assistant that finds relevant news websites.
             
-            # Add a delay to avoid rate limiting
-            time.sleep(2)
+            I need news websites for "{prompt}".
             
-            site_results = search_tool.run(site_query)
+            I have already checked these websites:
+            {', '.join(already_checked[:20])}
             
-            site_urls = []
-            for line in site_results.split('\n'):
-                urls = re.findall(r'https?://[^\s"\'<>]+', line)
-                site_urls.extend(urls)
+            Please provide at least 15 NEW news websites that are relevant to "{prompt}".
+            Return ONLY the full URLs (including https://) as a bulleted list.
+            Don't include any websites from the list I've already checked.
+            Focus on regional and local news sources that are most relevant.
+            Try to provide a diverse range of different sources.
+            """
+        else:
+            system_message = f"""You are a helpful assistant that finds relevant news websites.
             
-            # For each site URL, try to construct potential RSS feed URLs
-            for site_url in site_urls:
-                # Clean up the URL to get the base site
-                base_url = re.match(r'(https?://[^/]+)', site_url)
-                if base_url:
-                    base_url = base_url.group(1)
-                    # Append common RSS paths and add to potential feeds
-                    potential_feeds.extend([
-                        f"{base_url}/rss",
-                        f"{base_url}/feed",
-                        f"{base_url}/rss.xml",
-                        f"{base_url}/atom.xml",
-                        f"{base_url}/news/feed",
-                        f"{base_url}/feed/rss"
-                    ])
+            I need news websites for "{prompt}".
+            
+            Please provide at least 15 news websites that are relevant to "{prompt}".
+            Return ONLY the full URLs (including https://) as a bulleted list.
+            Focus on regional and local news sources that are most relevant.
+            Try to provide a diverse range of different sources.
+            """
         
-        # Remove duplicates and limit the number of feeds to avoid overwhelming validation
-        unique_feeds = list(set(potential_feeds))
-        print(f"Found {len(unique_feeds)} potential RSS feeds")
+        # Send the message to the LLM
+        messages = [HumanMessage(content=system_message)]
+        response = llm.invoke(messages)
         
-        # Return a reasonable number of feeds to validate
-        return json.dumps(unique_feeds[:30])
+        # Extract website URLs from the response
+        websites = []
+        for line in response.content.split('\n'):
+            # Look for URLs in the line
+            if '://' in line:
+                # Extract URLs
+                urls = re.findall(r'https?://[^\s\)\]\"\'\<\>]+', line)
+                websites.extend(urls)
         
+        # Clean up URLs
+        cleaned_websites = []
+        for url in websites:
+            # Remove trailing punctuation
+            url = re.sub(r'[.,;:]+$', '', url)
+            # Ensure URL has a scheme
+            if not url.startswith(('http://', 'https://')):
+                url = 'https://' + url
+            # Normalize the URL to remove trailing slashes for better comparison
+            if url.endswith('/'):
+                url = url[:-1]
+            cleaned_websites.append(url)
+        
+        return cleaned_websites
+    
     except Exception as e:
-        print(f"Error in discover_rss_feeds: {str(e)}")
-        # Don't return an empty list, as that will frustrate the model
-        return json.dumps([])
+        print(f"Error getting websites from LLM: {e}")
+        return []
 
-# Tool for the LLM to validate a batch of RSS feeds
-@tool
-def validate_feeds(feed_urls: list) -> dict:
-    """
-    Validate a list of RSS feed URLs and return those that are valid.
-    A valid feed must be properly formatted XML and have been updated within the last 72 hours.
-    """
-    global all_valid_feeds
-    valid_feeds = []
+# Process a single website to find and validate RSS feeds (for parallel processing)
+def process_website(website, valid_feeds_dict):
+    result_feeds = []
     
-    # Handle if feed_urls is a string (e.g., from JSON)
-    if isinstance(feed_urls, str):
-        try:
-            feed_urls = json.loads(feed_urls)
-        except json.JSONDecodeError:
-            # If it's a single URL string
-            feed_urls = [feed_urls]
+    # Skip if we already have enough feeds
+    if len(valid_feeds_dict) >= 10:
+        return website, result_feeds
     
-    for url in feed_urls:
-        # Skip URLs we've already validated
-        if any(feed["url"] == url for feed in all_valid_feeds):
-            print(f"Skipping already validated feed: {url}")
-            continue
+    print(f"Checking website: {website}")
+    
+    # Find potential RSS feed URLs for this website
+    potential_feeds = find_rss_feeds_from_site(website)
+    
+    # Process all feeds in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(potential_feeds)) as executor:
+        future_to_url = {executor.submit(validate_rss_feed, url): url for url in potential_feeds}
+        for future in concurrent.futures.as_completed(future_to_url):
+            url = future_to_url[future]
+            try:
+                is_valid, feed_info = future.result()
+                if is_valid:
+                    print(f"✅ Valid feed: {feed_info['title']} - {url}")
+                    result_feeds.append(feed_info)
+            except Exception as exc:
+                print(f"Error processing {url}: {exc}")
+    
+    return website, result_feeds
+
+# Deduplicate feeds to ensure variety
+def deduplicate_feeds(feeds, max_feeds=10):
+    if not feeds:
+        return []
+    
+    # First, normalize URLs and group by domain
+    domain_grouped = {}
+    normalized_urls = {}
+    
+    for feed in feeds:
+        domain = feed.get('domain', urlparse(feed['url']).netloc)
+        norm_url = normalize_url(feed['url'])
         
-        is_valid, feed_info = validate_rss_feed(url)
-        if is_valid:
-            valid_feeds.append(feed_info)
-            # Add to our global list of valid feeds
-            all_valid_feeds.append(feed_info)
+        # Add to domain group
+        if domain not in domain_grouped:
+            domain_grouped[domain] = []
+        
+        # Only add if we don't already have this URL (normalized)
+        if norm_url not in normalized_urls:
+            domain_grouped[domain].append(feed)
+            normalized_urls[norm_url] = feed
     
-    return {"valid_feeds": valid_feeds, "count": len(valid_feeds), "total_valid": len(all_valid_feeds)}
+    # Create a deduplicated list ensuring variety
+    result = []
+    
+    # First, take one feed from each domain until we reach max_feeds
+    domains = list(domain_grouped.keys())
+    while len(result) < max_feeds and domains:
+        for domain in list(domains):  # Create a copy to safely modify during iteration
+            if not domain_grouped[domain]:
+                domains.remove(domain)
+                continue
+                
+            feed = domain_grouped[domain].pop(0)
+            result.append(feed)
+            
+            if len(result) >= max_feeds:
+                break
+    
+    return result[:max_feeds]
 
 def main():
     # Check if a prompt was provided as a command-line argument
@@ -237,129 +256,84 @@ def main():
     filename = re.sub(r'[^\w\s]', '', PROMPT.lower())[:20].strip().replace(' ', '_')
     output_file = f"{filename}_rss_feeds_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
     
-    # Get the API key
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        print("Error: OPENROUTER_API_KEY not found in environment variables.")
-        print("Please make sure your .env file contains the OPENROUTER_API_KEY.")
-        sys.exit(1)
+    # Storage for feeds we've found and websites we've checked
+    valid_feeds = []
+    checked_websites = []
+    max_model_requests = 3
+    model_requests = 0
     
-    # Initialize the LLM with OpenRouter
-    try:
-        llm = ChatOpenAI(
-            model="google/gemini-2.0-flash-exp:free",
-            api_key=api_key,
-            base_url="https://openrouter.ai/api/v1"
-        )
+    while len(valid_feeds) < 10 and model_requests < max_model_requests:
+        model_requests += 1
+        print(f"\n=== Model request {model_requests}/{max_model_requests}: Getting news websites from LLM ===")
         
-        # Define system prompt
-        system_prompt = """You are an assistant that helps find valid RSS feeds on the internet.
-        Your task is to search for RSS feeds based on the user's query.
-        You need to be thorough and creative in your search to find at least 10 valid RSS feeds.
+        # Get websites from LLM
+        websites = get_news_websites_from_llm(PROMPT, checked_websites)
         
-        When you find potential RSS feeds, use the validate_feeds function to check if they are valid.
-        A valid feed must be properly formatted XML and have been updated within the last 72 hours.
+        # Filter out websites we've already checked
+        websites = [site for site in websites if site not in checked_websites]
         
-        Follow this process:
-        1. Use discover_rss_feeds to search for potential RSS feeds with specific search terms
-        2. Use validate_feeds to check which feeds are valid
-        3. If you don't have enough valid feeds, try again with different search terms
+        print(f"Found {len(websites)} new websites to check:")
+        for i, site in enumerate(websites, 1):
+            print(f"  {i}. {site}")
         
-        Be strategic in your search:
-        - For news sites, try main domain + /rss, /feed, /rss.xml, or /atom.xml
-        - Look for specialized local news sources related to the region
-        - Try different categories: politics, environment, sports, culture
-        - Consider blogs, government sites, and university news related to the query
+        if not websites:
+            print("No new websites to check. Moving on...")
+            continue
         
-        Remember to use different search strategies for different iterations.
-        """
+        # Process websites in parallel
+        print("\n=== Processing websites to find valid RSS feeds ===")
         
-        # Define the tools
-        tools = [discover_rss_feeds, validate_feeds]
+        # We'll use a dictionary for atomic updates during parallel processing
+        valid_feeds_dict = {normalize_url(feed["url"]): feed for feed in valid_feeds}
         
-        # Create the agent
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ])
+        all_new_feeds = []
         
-        agent = create_tool_calling_agent(llm, tools, prompt)
-        agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-        
-        # Storage for valid feeds
-        global all_valid_feeds
-        all_valid_feeds = []
-        
-        # First iteration instructions
-        user_input = f"""Find me all valid RSS feeds that have anything to do with news in Hawaii.
-        I need at least 10 valid and active RSS feeds. 
-        Use the discover_rss_feeds function to search for feeds, and then the validate_feeds function to check which ones are valid.
-        Be thorough and creative in your search."""
-        
-        # Run the agent in a loop until we have at least 10 valid feeds
-        iteration = 1
-        max_iterations = 3
-        
-        while len(all_valid_feeds) < 10:
-            print(f"\n=== Iteration {iteration}: Looking for RSS feeds ({len(all_valid_feeds)}/10 found so far) ===")
-            
-            try:
-                # Run the agent
-                result = agent_executor.invoke({"input": user_input, "chat_history": []})
-                
-                # Extract any valid feeds from the result
-                content = result.get("output", "")
-                print(f"\nAgent response: {content}")
-                
-                print(f"\nValid feeds found so far: {len(all_valid_feeds)}/10")
-                for i, feed in enumerate(all_valid_feeds, 1):
-                    print(f"  {i}. {feed['title']} - {feed['url']}")
-                
-                # If we've found enough feeds, break the loop
-                if len(all_valid_feeds) >= 10:
-                    print("Successfully found at least 10 valid RSS feeds!")
-                    break
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(websites))) as executor:
+            future_to_site = {executor.submit(process_website, site, valid_feeds_dict): site for site in websites}
+            for future in concurrent.futures.as_completed(future_to_site):
+                site = future_to_site[future]
+                try:
+                    site, new_feeds = future.result()
+                    # Remember we checked this website
+                    checked_websites.append(site)
                     
-                # Sleep a bit to avoid rate limiting
-                print("Waiting a moment before continuing...")
-                time.sleep(5)  # Increased delay to help with rate limiting
-                
-                # Update the user input for the next iteration
-                feed_urls = [feed["url"] for feed in all_valid_feeds]
-                user_input = f"""I found {len(all_valid_feeds)} valid RSS feeds so far: {feed_urls}
-                I need {10 - len(all_valid_feeds)} more valid RSS feeds about news in Hawaii.
-                Please search for different feeds than the ones I already have.
-                Be more creative in your search terms and try to find local news sources, blogs, or specialized news sites.
-                Look for Hawaii-specific topics like local politics, tourism, environment, culture, or sports."""
-                
-            except Exception as e:
-                print(f"Error during iteration {iteration}: {str(e)}")
-                # If an iteration fails, try to continue with a different approach
-                user_input = "Find me RSS feeds for major Hawaii news sources and newspapers"
-                print("Trying a simpler approach for the next iteration")
-                time.sleep(3)
-            
-            iteration += 1
-            if iteration > max_iterations:  # Safety limit
-                print(f"Reached maximum number of iterations ({max_iterations}). Stopping search.")
-                print(f"Found {len(all_valid_feeds)} valid feeds, which is less than the target of 10.")
-                # Continue to save what we found
-                break
+                    # Collect all new feeds
+                    all_new_feeds.extend(new_feeds)
+                        
+                except Exception as exc:
+                    print(f"Error processing {site}: {exc}")
+                    checked_websites.append(site)
         
-        # Save the valid feeds to a JSON file - we always create only one file per run
-        with open(output_file, 'w') as f:
-            json.dump({"feeds": all_valid_feeds, "count": len(all_valid_feeds), "query": PROMPT}, f, indent=2)
+        # Deduplicate all feeds found so far
+        deduped_new_feeds = deduplicate_feeds(all_new_feeds)
         
-        print(f"\n✅ Found {len(all_valid_feeds)} valid RSS feeds. Saved to {output_file}")
-        if len(all_valid_feeds) < 10:
-            print("Note: Found fewer than 10 valid feeds. You might want to run the script again with a different prompt.")
+        # Add only new feeds to our collection
+        for feed in deduped_new_feeds:
+            norm_url = normalize_url(feed["url"])
+            if norm_url not in valid_feeds_dict and len(valid_feeds) < 10:
+                valid_feeds.append(feed)
+                valid_feeds_dict[norm_url] = feed
+                print(f"Added feed: {feed['title']} ({len(valid_feeds)}/10)")
         
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        print("Please check your OPENROUTER_API_KEY and ensure you have an internet connection.")
-        sys.exit(1)
+        # If we have enough feeds after deduplication, break the loop
+        if len(valid_feeds) >= 10:
+            break
+    
+    # Final deduplication to ensure variety
+    valid_feeds = deduplicate_feeds(valid_feeds, 10)
+    
+    # Display the final results
+    print(f"\n=== Found {len(valid_feeds)}/10 valid RSS feeds ===")
+    for i, feed in enumerate(valid_feeds, 1):
+        print(f"  {i}. {feed['title']} - {feed['url']}")
+    
+    # Save the valid feeds to a JSON file
+    with open(output_file, 'w') as f:
+        json.dump({"feeds": valid_feeds, "count": len(valid_feeds), "query": PROMPT}, f, indent=2)
+    
+    print(f"\n✅ Found {len(valid_feeds)} valid RSS feeds. Saved to {output_file}")
+    if len(valid_feeds) < 10:
+        print("Note: Found fewer than 10 valid feeds. You might want to run the script again with a different prompt.")
 
 if __name__ == "__main__":
     main()
